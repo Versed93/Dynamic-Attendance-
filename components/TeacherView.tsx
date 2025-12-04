@@ -126,12 +126,6 @@ export const TeacherView: React.FC<TeacherViewProps> = ({
     }
   }, [qrData, logoImg]);
 
-  useEffect(() => {
-    if (canvasRef.current && qrData) {
-      // Logic handled in the effect above which depends on [qrData, logoImg]
-    }
-  }, []);
-
   // Update current time periodically for filtering
   useEffect(() => {
     if (timeFilter === 'all') return;

@@ -29,8 +29,6 @@ interface TeacherViewProps {
 
 type SortOption = 'id' | 'newest' | 'oldest';
 
-const UTS_LOGO_URL = "https://upload.wikimedia.org/wikipedia/en/2/23/University_of_Technology_Sarawak_Logo.png";
-
 export const TeacherView: React.FC<TeacherViewProps> = ({ 
   attendanceList, 
   onTestAttendance, 
@@ -87,8 +85,7 @@ export const TeacherView: React.FC<TeacherViewProps> = ({
       QRCode.toCanvas(canvasRef.current, qrData, { 
           width: 600, // Increased resolution for larger display
           color: { dark: '#000000', light: '#ffffff' },
-          margin: 2,
-          errorCorrectionLevel: 'H' // High error correction to allow logo embedding
+          margin: 2
         }, (error) => {
         if (error) {
             console.error(error);
@@ -524,14 +521,6 @@ export const TeacherView: React.FC<TeacherViewProps> = ({
             {/* QR Wrapper to position Logo */}
             <div className="relative w-full max-w-[600px] mx-auto">
               <canvas ref={canvasRef} className="rounded-md w-full h-auto block" />
-              {/* Logo Overlay - Centered Absolute */}
-              <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 w-[22%] h-[22%] bg-white rounded-full flex items-center justify-center shadow-sm border-2 border-white">
-                  <img 
-                    src={UTS_LOGO_URL} 
-                    alt="UTS Logo" 
-                    className="w-[85%] h-[85%] object-contain"
-                  />
-              </div>
             </div>
           </div>
           <p className="text-gray-500 text-sm mt-4 text-center">Scan with any camera app. Refreshes every second.</p>

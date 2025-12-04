@@ -17,7 +17,6 @@ type Status = 'validating' | 'form' | 'success' | 'error' | 'cooldown';
 const COOLDOWN_MINUTES = 30;
 const COOLDOWN_MS = COOLDOWN_MINUTES * 60 * 1000;
 const LAST_SCAN_KEY = 'attendance-last-scan-standard-v1';
-const LOGO_URL = "https://upload.wikimedia.org/wikipedia/en/2/23/University_of_Technology_Sarawak_Logo.png";
 
 export const StudentView: React.FC<StudentViewProps> = ({ markAttendance, token, bypassRestrictions = false, onExit }) => {
   const [name, setName] = useState('');
@@ -228,13 +227,6 @@ export const StudentView: React.FC<StudentViewProps> = ({ markAttendance, token,
         {status === 'form' && (
             <form onSubmit={handleSubmit} className="space-y-4">
                 <div className="text-center mb-4">
-                    <div className="flex justify-center mb-4">
-                        <img 
-                            src={LOGO_URL} 
-                            alt="UTS Logo" 
-                            className="h-24 w-auto object-contain"
-                        />
-                    </div>
                     <h3 className="text-xl font-bold text-gray-800">
                         {bypassRestrictions ? 'Admin Mode' : 'Enter Details'}
                     </h3>

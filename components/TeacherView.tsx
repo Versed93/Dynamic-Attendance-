@@ -25,6 +25,7 @@ interface TeacherViewProps {
   onScriptUrlChange: (url: string) => void;
   onOpenKiosk: () => void;
   onManualAdd: (name: string, id: string, email: string, status: 'P' | 'A') => {success: boolean, message: string};
+  pendingSyncCount?: number;
 }
 
 type SortOption = 'id' | 'newest' | 'oldest';
@@ -38,7 +39,8 @@ export const TeacherView: React.FC<TeacherViewProps> = ({
   scriptUrl, 
   onScriptUrlChange, 
   onOpenKiosk, 
-  onManualAdd 
+  onManualAdd,
+  pendingSyncCount = 0
 }) => {
   const [baseUrl, setBaseUrl] = useState<string>(window.location.href.split('?')[0]);
   const [qrData, setQrData] = useState<string>('');
@@ -269,7 +271,15 @@ export const TeacherView: React.FC<TeacherViewProps> = ({
         <div className="w-full lg:w-[40%] order-2 lg:order-1">
           <div className="flex flex-col gap-3 mb-4">
              <div className="flex justify-between items-center flex-wrap gap-2">
-                <h2 className="text-2xl font-bold text-brand-primary">Attendance History</h2>
+                <div className="flex items-center gap-3">
+                    <h2 className="text-2xl font-bold text-brand-primary">Attendance History</h2>
+                    {pendingSyncCount > 0 && (
+                        <div className="flex items-center gap-1.5 px-2 py-1 bg-blue-100 text-blue-700 rounded-full text-xs font-semibold animate-pulse" title={`${pendingSyncCount} records waiting to be saved to Cloud`}>
+                            <ClockIcon className="w-3.5 h-3.5" />
+                            <span>Saving ({pendingSyncCount})...</span>
+                        </div>
+                    )}
+                </div>
                 <div className="flex items-center gap-2">
                     {/* Time Filter */}
                     <div className="flex items-center gap-1 bg-white border border-gray-300 rounded px-2 py-1 shadow-sm" title="Auto-hide older records">

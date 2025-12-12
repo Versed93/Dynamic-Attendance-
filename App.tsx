@@ -1,4 +1,3 @@
-
 import React, { useState, useCallback, useEffect } from 'react';
 import { TeacherView } from './components/TeacherView';
 import { StudentView } from './components/StudentView';
@@ -9,6 +8,13 @@ type View = 'teacher' | 'student';
 const STORAGE_KEY = 'attendance-storage-standard-v1';
 const DELETED_IDS_KEY = 'attendance-deleted-ids-v1';
 const SCRIPT_URL_KEY = 'attendance-script-url-v21';
+const SYNC_QUEUE_KEY = 'attendance-sync-queue-v2';
+
+interface SyncTask {
+  id: string;
+  data: Record<string, string>;
+  timestamp: number;
+}
 
 const App: React.FC = () => {
   // Determine view based on URL parameters
@@ -32,11 +38,23 @@ const App: React.FC = () => {
   });
   
   // Initialize with the user-provided Web App URL or empty.
-  // We use lazy initialization here to check localStorage FIRST.
   const [scriptUrl, setScriptUrl] = useState<string>(() => {
     const saved = localStorage.getItem(SCRIPT_URL_KEY);
     return saved || 'https://script.google.com/macros/s/AKfycbxPcnCL5b7z_C9-PJXQH03r9IMPoDlxOeJqSv5A6ZtQCmgCk6XDeBUDcDjYaDX9gbIx/exec';
   });
+
+  // Sync Queue State - Initialize from LocalStorage to persist across reloads
+  const [syncQueue, setSyncQueue] = useState<SyncTask[]>(() => {
+      try {
+          const saved = localStorage.getItem(SYNC_QUEUE_KEY);
+          return saved ? JSON.parse(saved) : [];
+      } catch (e) {
+          return [];
+      }
+  });
+  const [isSyncing, setIsSyncing] = useState(false);
+
+  // --- PERSISTENCE EFFECTS ---
 
   // Load attendance data from LocalStorage on mount
   useEffect(() => {
@@ -53,21 +71,69 @@ const App: React.FC = () => {
     }
   }, []);
 
-  // Save data to LocalStorage whenever it changes
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(attendanceList));
   }, [attendanceList]);
 
-  // Save deleted IDs to LocalStorage
   useEffect(() => {
     localStorage.setItem(DELETED_IDS_KEY, JSON.stringify(Array.from(locallyDeletedIds)));
   }, [locallyDeletedIds]);
   
-  // Save Script URL to LocalStorage whenever it changes (Auto-save)
   useEffect(() => {
     localStorage.setItem(SCRIPT_URL_KEY, scriptUrl);
   }, [scriptUrl]);
 
+  // Save Sync Queue
+  useEffect(() => {
+    localStorage.setItem(SYNC_QUEUE_KEY, JSON.stringify(syncQueue));
+  }, [syncQueue]);
+
+  // --- SYNC PROCESSOR ---
+  // Processes queue items one by one to prevent hitting Google Script rate limits/lock contention
+  useEffect(() => {
+    if (syncQueue.length === 0 || isSyncing) return;
+    if (!scriptUrl || !scriptUrl.startsWith('http')) return;
+
+    const processNext = async () => {
+        setIsSyncing(true);
+        const task = syncQueue[0];
+
+        try {
+            const formData = new URLSearchParams();
+            Object.entries(task.data).forEach(([k, v]) => formData.append(k, String(v)));
+
+            // We use no-cors + keepalive to ensure it sends even if tab closes, 
+            // and we don't care about reading the opaque response.
+            await fetch(scriptUrl.trim(), {
+                method: 'POST',
+                mode: 'no-cors',
+                keepalive: true, 
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                body: formData
+            });
+
+            // THROTTLE: Wait 800ms before next request to allow Google Script Lock to release
+            await new Promise(resolve => setTimeout(resolve, 800));
+
+            // Remove from queue on "success" (no network error)
+            setSyncQueue(prev => prev.filter(t => t.id !== task.id));
+
+        } catch (err) {
+            console.error("Sync failed, retrying in 5s...", err);
+            // On network error, keep item in queue and wait 5s before retrying
+            await new Promise(resolve => setTimeout(resolve, 5000));
+        } finally {
+            setIsSyncing(false);
+        }
+    };
+
+    processNext();
+  }, [syncQueue, isSyncing, scriptUrl]);
+
+
+  // --- POLLING ---
   // Poll for updates if scriptUrl is present and we are in Teacher View
   useEffect(() => {
     if (!scriptUrl || !scriptUrl.startsWith('http') || view === 'student') return;
@@ -76,18 +142,13 @@ const App: React.FC = () => {
 
     const fetchData = async () => {
       try {
-        // Add cache: 'no-store' to prevent browser caching of the GET request
         const response = await fetch(`${scriptUrl.trim()}?action=read&_=${Date.now()}`, {
           method: 'GET',
           cache: 'no-store',
-          headers: {
-            'Content-Type': 'text/plain',
-          },
+          headers: { 'Content-Type': 'text/plain' },
         });
         
-        if (!response.ok) {
-           return;
-        }
+        if (!response.ok) return;
 
         const data = await response.json();
         
@@ -95,30 +156,25 @@ const App: React.FC = () => {
            setAttendanceList(prevList => {
                const mergedMap = new Map<string, Student>();
                
-               // 1. Start with existing local data to preserve timestamps and pending items
+               // 1. Start with existing local data
                prevList.forEach(s => {
                    if (s.studentId) {
                        mergedMap.set(s.studentId.toUpperCase(), s);
                    }
                });
                
-               // 2. Merge server data (Update existing, Add new)
+               // 2. Merge server data
                (data as any[]).forEach((item: any) => {
                    if (!item.studentId) return;
-                   
                    const normalizedId = item.studentId.toUpperCase();
                    
-                   // Skip if explicitly deleted locally
                    if (locallyDeletedIds.has(normalizedId)) return;
 
                    const existing = mergedMap.get(normalizedId);
-                   
                    mergedMap.set(normalizedId, {
                        name: item.name ? item.name.toUpperCase() : '',
                        studentId: normalizedId,
                        email: item.email ? item.email.toUpperCase() : '',
-                       // Keep existing timestamp if available to preserve sort order/scan time
-                       // If new from server, use item.timestamp (which is likely current server time)
                        timestamp: existing ? existing.timestamp : (item.timestamp || Date.now()),
                        status: item.status || 'P',
                    });
@@ -128,13 +184,12 @@ const App: React.FC = () => {
            });
         }
       } catch (e) {
-        console.warn('Polling failed (this is normal if offline or script URL is invalid):', e);
+        console.warn('Polling failed:', e);
       }
     };
 
-    // Poll every 5 seconds
     const interval = setInterval(fetchData, 5000);
-    fetchData(); // Initial fetch
+    fetchData(); 
     return () => {
         isMounted = false;
         clearInterval(interval);
@@ -147,7 +202,7 @@ const App: React.FC = () => {
     // Check local duplicates
     const isDuplicate = attendanceList.some(s => s.studentId.toUpperCase() === normalizedId);
     
-    // If student was previously deleted locally, un-delete them so they show up
+    // If student was previously deleted locally, un-delete them
     setLocallyDeletedIds(prev => {
         if (prev.has(normalizedId)) {
             const next = new Set(prev);
@@ -157,7 +212,6 @@ const App: React.FC = () => {
         return prev;
     });
 
-    // Add new
     const newStudent: Student = {
       name,
       studentId: normalizedId,
@@ -166,34 +220,29 @@ const App: React.FC = () => {
       status
     };
 
+    // Optimistic Update
     if (!isDuplicate) {
         setAttendanceList(prevList => [newStudent, ...prevList]);
     } else {
-         // Even if duplicate locally, we might want to allow re-submission or just update timestamp.
-         // For now, we update the timestamp of the existing entry and move to top
          setAttendanceList(prevList => {
              const filtered = prevList.filter(s => s.studentId.toUpperCase() !== normalizedId);
              return [newStudent, ...filtered];
          });
     }
     
-    // Send to Google Apps Script for Storage (Background)
+    // Add to Background Sync Queue
     if (scriptUrl && scriptUrl.startsWith('http')) {
-        // Use URLSearchParams to send as application/x-www-form-urlencoded
-        const formData = new URLSearchParams();
-        formData.append('studentId', normalizedId);
-        formData.append('name', name);
-        formData.append('email', email);
-        formData.append('status', status);
-
-        fetch(scriptUrl.trim(), {
-            method: 'POST',
-            mode: 'no-cors', // Opaque response
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
+        const task: SyncTask = {
+            id: Math.random().toString(36).substring(2, 9) + Date.now().toString(),
+            data: {
+                studentId: normalizedId,
+                name: name,
+                email: email,
+                status: status
             },
-            body: formData
-        }).catch(err => console.error("Failed to send data to script", err));
+            timestamp: Date.now()
+        };
+        setSyncQueue(prev => [...prev, task]);
     }
 
     return { success: true, message: 'Attendance recorded!' };
@@ -210,50 +259,46 @@ const App: React.FC = () => {
         return student;
     }));
 
-    // 2. Send updates to Server
-    // Note: Since the Google Script processes one at a time, we send multiple requests.
-    // In a production environment with high volume, a bulk API endpoint would be better.
+    // 2. Queue updates for Background Sync
     if (scriptUrl && scriptUrl.startsWith('http')) {
+        const newTasks: SyncTask[] = [];
+        
         normalizedIds.forEach(id => {
             const student = attendanceList.find(s => s.studentId === id);
-            // We need the name/email from the existing record to satisfy the script requirements
-            // If the student isn't found in current list (unlikely), we skip
+            // If student isn't found in current list but we are updating them, 
+            // we skip valid data check. Ideally we should have the data.
+            // We use the data from the list.
             if (student) {
-                const formData = new URLSearchParams();
-                formData.append('studentId', student.studentId);
-                formData.append('name', student.name);
-                formData.append('email', student.email);
-                formData.append('status', status);
-
-                fetch(scriptUrl.trim(), {
-                    method: 'POST',
-                    mode: 'no-cors',
-                    headers: {
-                        'Content-Type': 'application/x-www-form-urlencoded',
+                newTasks.push({
+                    id: Math.random().toString(36).substring(2, 9) + Date.now().toString(),
+                    data: {
+                        studentId: student.studentId,
+                        name: student.name,
+                        email: student.email,
+                        status: status
                     },
-                    body: formData
-                }).catch(err => console.error(`Failed to update status for ${id}`, err));
+                    timestamp: Date.now()
+                });
             }
         });
+        
+        setSyncQueue(prev => [...prev, ...newTasks]);
     }
   }, [attendanceList, scriptUrl]);
 
   const handleTestAttendance = () => {
       const randomId = Math.floor(Math.random() * 1000);
-      const newStudent: Student = {
+      const newStudent = {
           name: "TEST STUDENT",
           studentId: `TEST-${randomId}`,
           email: `TEST${randomId}@EXAMPLE.COM`,
-          timestamp: Date.now(),
-          status: 'P'
+          status: 'P' as 'P' | 'A'
       };
-      
       handleMarkAttendance(newStudent.name, newStudent.studentId, newStudent.email, 'P');
   };
 
   const handleClearAttendance = () => {
       if (window.confirm("WARNING: This will clear the LOCAL attendance list. It will NOT delete data from the Google Sheet.")) {
-        // Mark currently visible students as deleted so polling doesn't restore them immediately
         const currentIds = attendanceList.map(s => s.studentId.toUpperCase());
         setLocallyDeletedIds(prev => {
             const next = new Set(prev);
@@ -266,13 +311,11 @@ const App: React.FC = () => {
 
   const handleRemoveStudents = useCallback((studentIds: string[]) => {
       const normalizedIds = studentIds.map(id => id.toUpperCase());
-      // Update locally deleted IDs to prevent polling resurrection
       setLocallyDeletedIds(prev => {
           const next = new Set(prev);
           normalizedIds.forEach(id => next.add(id));
           return next;
       });
-      // Deletes locally
       setAttendanceList(prevList => prevList.filter(s => !normalizedIds.includes(s.studentId.toUpperCase())));
   }, []);
   
@@ -308,6 +351,7 @@ const App: React.FC = () => {
             onScriptUrlChange={setScriptUrl} 
             onOpenKiosk={handleOpenKiosk}
             onManualAdd={handleMarkAttendance}
+            pendingSyncCount={syncQueue.length}
         />
     );
   };

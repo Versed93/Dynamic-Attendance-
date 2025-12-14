@@ -1,15 +1,69 @@
+
 import React, { useState } from 'react';
 import { InfoIcon } from './icons/InfoIcon';
 
 const appScriptCode = `
 // --- CONFIGURATION ---
-// Sheet Name: "W1-W5"
-// Date Header Row: 12 (E.g. Cell O12:P12 is one date)
-// Student Data Starts: Row 14 (ID in Col B, Name in Col D)
-// Status Area: Columns O to T (Rows 14-225+)
+// Sheets: "W1-W5" (Cols O-T) -> "W6-W10" (Cols K-T) -> "W11-W14" (Cols K-T)
+// Date Header Row: 12
+// Student Data: Row 14+ (ID in Col B, Name in Col D)
 
 function getFormattedDate() {
   return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "dd/MM/yyyy");
+}
+
+function getSheetConfigs() {
+  return [
+    // Order matters: Fills W1-W5 first, then moves to W6-W10, then W11-W14
+    { name: "W1-W5", dateRow: 12, startCol: 15, endCol: 20 }, // Cols O to T
+    { name: "W6-W10", dateRow: 12, startCol: 11, endCol: 20 }, // Cols K to T
+    { name: "W11-W14", dateRow: 12, startCol: 11, endCol: 20 } // Cols K to T
+  ];
+}
+
+function findTargetContext(doc, dateStr) {
+  var configs = getSheetConfigs();
+  
+  // 1. Search for EXISTING date across all configured sheets
+  for (var i = 0; i < configs.length; i++) {
+    var conf = configs[i];
+    var sheet = doc.getSheetByName(conf.name);
+    if (!sheet) continue;
+    
+    for (var c = conf.startCol; c <= conf.endCol; c++) {
+       var cell = sheet.getRange(conf.dateRow, c);
+       // Handle Merged Cells (only check top-left)
+       if (cell.isPartOfMerge()) {
+          var range = cell.getMergedRanges()[0];
+          if (range.getColumn() != c || range.getRow() != conf.dateRow) continue;
+       }
+       
+       if (cell.getDisplayValue().trim() == dateStr) {
+         return { sheet: sheet, col: c, isNew: false };
+       }
+    }
+  }
+
+  // 2. Search for first EMPTY slot if date not found
+  for (var i = 0; i < configs.length; i++) {
+    var conf = configs[i];
+    var sheet = doc.getSheetByName(conf.name);
+    if (!sheet) continue;
+    
+    for (var c = conf.startCol; c <= conf.endCol; c++) {
+       var cell = sheet.getRange(conf.dateRow, c);
+       if (cell.isPartOfMerge()) {
+          var range = cell.getMergedRanges()[0];
+          if (range.getColumn() != c || range.getRow() != conf.dateRow) continue;
+       }
+       
+       if (cell.getDisplayValue().trim() == "") {
+         return { sheet: sheet, col: c, isNew: true };
+       }
+    }
+  }
+  
+  return null;
 }
 
 function doPost(e) {
@@ -18,9 +72,8 @@ function doPost(e) {
     lock.waitLock(30000); 
     
     var doc = SpreadsheetApp.getActiveSpreadsheet();
-    var sheet = doc.getSheetByName("W1-W5"); 
-    if (!sheet) sheet = doc.getSheets()[0];
-
+    
+    // Parse Input
     var data = {};
     if (e.parameter && e.parameter.studentId) {
       data = e.parameter;
@@ -39,70 +92,29 @@ function doPost(e) {
       return ContentService.createTextOutput(JSON.stringify({"result":"error", "message":"Missing Data"})).setMimeType(ContentService.MimeType.JSON);
     }
 
-    // --- 1. FIND DATE COLUMN (O-T) ---
-    var dateHeaderRow = 12;
-    var dateStartCol = 15; // Column O
-    var maxDateCols = 6;   // Columns O, P, Q, R, S, T
+    // --- FIND SHEET & COLUMN ---
+    var context = findTargetContext(doc, dateStr);
     
-    var targetColAbs = -1;
+    if (!context) {
+      return ContentService.createTextOutput(JSON.stringify({"result":"error", "message":"All sheets (W1-W5, W6-W10, W11-W14) are full."})).setMimeType(ContentService.MimeType.JSON);
+    }
+    
+    var sheet = context.sheet;
+    var targetColAbs = context.col;
 
-    // Pass 1: Look for existing date matches
-    for (var i = 0; i < maxDateCols; i++) {
-       var col = dateStartCol + i;
-       var cell = sheet.getRange(dateHeaderRow, col);
-       
-       if (cell.isPartOfMerge()) {
-          var range = cell.getMergedRanges()[0];
-          if (range.getColumn() != col || range.getRow() != dateHeaderRow) {
-             continue; 
-          }
-       }
-
-       var val = cell.getDisplayValue().trim();
-       if (val == dateStr) {
-         targetColAbs = col;
-         break;
-       }
+    // Initialize Date Header if new
+    if (context.isNew) {
+      sheet.getRange(12, targetColAbs).setValue(new Date()).setNumberFormat("dd/MM/yyyy");
     }
 
-    // Pass 2: If no match, find first EMPTY slot
-    if (targetColAbs == -1) {
-      for (var i = 0; i < maxDateCols; i++) {
-        var col = dateStartCol + i;
-        var cell = sheet.getRange(dateHeaderRow, col);
-        
-        if (cell.isPartOfMerge()) {
-           var range = cell.getMergedRanges()[0];
-           if (range.getColumn() != col || range.getRow() != dateHeaderRow) {
-              continue; // Skip secondary merge cells
-           }
-        }
-
-        var val = cell.getDisplayValue().trim();
-        if (val == "") {
-           targetColAbs = col;
-           // Set a standard Date object and enforce the number format.
-           // This prevents mismatches between what is written and what is read back.
-           cell.setValue(new Date()).setNumberFormat("dd/MM/yyyy");
-           break;
-        }
-      }
-    }
-
-    if (targetColAbs == -1) {
-      return ContentService.createTextOutput(JSON.stringify({"result":"error", "message":"No space left in columns O-T"})).setMimeType(ContentService.MimeType.JSON);
-    }
-
-    // --- 2. FIND STUDENT ROW (B14+) ---
+    // --- FIND STUDENT ROW (B14+) ---
     var startRow = 14;
     var idCol = 2; // Column B
     var nameCol = 4; // Column D
     
-    // Scan B14 down to B250 or last row
     var lastSheetRow = Math.max(sheet.getLastRow(), 250);
-    var checkRows = lastSheetRow - startRow + 1; 
-    var idRange = sheet.getRange(startRow, idCol, checkRows, 1);
-    var idValues = idRange.getValues();
+    // Optimization: Read ID column in one batch
+    var idValues = sheet.getRange(startRow, idCol, lastSheetRow - startRow + 1, 1).getValues();
     
     var studentRowRelative = -1;
     var firstEmptyRowRelative = -1;
@@ -127,13 +139,12 @@ function doPost(e) {
       }
 
       var newRowAbs = startRow + studentRowRelative;
-      sheet.getRange(newRowAbs, idCol).setValue(studentId);   // Write to B
-      sheet.getRange(newRowAbs, nameCol).setValue(studentName); // Write to D
+      sheet.getRange(newRowAbs, idCol).setValue(studentId);   
+      sheet.getRange(newRowAbs, nameCol).setValue(studentName); 
     }
 
-    // --- 3. WRITE STATUS ---
+    // --- WRITE STATUS ---
     var targetRowAbs = startRow + studentRowRelative;
-    // Write to the main column found (e.g. O). If O:P is merged, writing to O fills the block.
     sheet.getRange(targetRowAbs, targetColAbs).setValue(status);
     
     SpreadsheetApp.flush(); 
@@ -148,47 +159,32 @@ function doPost(e) {
 
 function doGet(e) {
   var doc = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = doc.getSheetByName("W1-W5");
-  if (!sheet) sheet = doc.getSheets()[0];
-
   var dateStr = getFormattedDate();
   
-  var dateHeaderRow = 12;
-  var dateStartCol = 15; // O
-  var maxDateCols = 6;   // O-T
-
-  var dateColAbs = -1;
-  for (var i = 0; i < maxDateCols; i++) {
-     var col = dateStartCol + i;
-     var cell = sheet.getRange(dateHeaderRow, col);
-     
-     if (cell.isPartOfMerge()) {
-        var range = cell.getMergedRanges()[0];
-        if (range.getColumn() != col || range.getRow() != dateHeaderRow) continue;
-     }
-
-     if (cell.getDisplayValue().trim() == dateStr) {
-       dateColAbs = col;
-       break;
-     }
+  var context = findTargetContext(doc, dateStr);
+  
+  // If date not found (isNew=true means we found an empty slot but not the date), return empty
+  if (!context || context.isNew) {
+     return ContentService.createTextOutput("[]").setMimeType(ContentService.MimeType.JSON);
   }
 
-  if (dateColAbs == -1) return ContentService.createTextOutput("[]").setMimeType(ContentService.MimeType.JSON);
+  var sheet = context.sheet;
+  var dateColAbs = context.col;
 
-  // Read Data (B=ID, D=Name, TargetCol=Status)
+  // Read Data
   var startRow = 14;
   var lastRow = Math.max(sheet.getLastRow(), 250); 
   
-  // Read B, C, D (Cols 2, 3, 4)
-  var studentBlock = sheet.getRange(startRow, 2, lastRow - startRow + 1, 3).getValues(); 
+  // Read B (ID), D (Name)
+  var studentBlock = sheet.getRange(startRow, 2, lastRow - startRow + 1, 3).getValues(); // Cols 2,3,4
   
   // Read Status Column
   var statusBlock = sheet.getRange(startRow, dateColAbs, lastRow - startRow + 1, 1).getValues();
 
   var output = [];
   for (var i = 0; i < studentBlock.length; i++) {
-    var id = String(studentBlock[i][0]).trim(); // Column B
-    var name = studentBlock[i][2]; // Column D
+    var id = String(studentBlock[i][0]).trim(); // Col B (index 0)
+    var name = studentBlock[i][2]; // Col D (index 2)
     var status = statusBlock[i][0];
 
     if (id && (status == 'P' || status == 'A')) {
@@ -222,13 +218,13 @@ export const GoogleSheetIntegrationInfo: React.FC = () => {
         <div>
           <h3 className="text-lg font-semibold text-blue-900">Update Cloud Storage Script</h3>
           <p className="mt-1 text-sm">
-            This update fixes an issue where attendance was sometimes recorded in a new column on the same day. The script is now more reliable at finding the correct date column.
+            This update allows the system to automatically switch to subsequent sheets when the previous ones are full.
           </p>
           <ul className="list-disc list-inside mt-2 text-sm space-y-1">
-            <li><strong>Headers:</strong> Row 12 (Merges supported, e.g., O12:P12).</li>
-            <li><strong>IDs/Names:</strong> Rows 14+ (Column B & D).</li>
-            <li><strong>Status:</strong> Writes to O14:P225+ range (or Q:R for next date).</li>
-            <li><strong>Limits:</strong> Strictly columns O through T only.</li>
+            <li><strong>Sheets Order:</strong> W1-W5 (Cols O-T) → W6-W10 (Cols K-T) → W11-W14 (Cols K-T).</li>
+            <li><strong>Headers:</strong> Row 12 (Date is auto-filled here).</li>
+            <li><strong>Student Data:</strong> Rows 14+ (Column B & D).</li>
+            <li><strong>Overflow:</strong> Automatically finds the first empty column across all configured sheets.</li>
           </ul>
           <div className="mt-4 bg-gray-800 text-white p-3 rounded-md relative">
              <div className="flex justify-between items-center mb-2">

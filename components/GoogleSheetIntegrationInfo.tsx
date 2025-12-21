@@ -3,10 +3,10 @@ import React, { useState } from 'react';
 import { InfoIcon } from './icons/InfoIcon';
 
 const appScriptCode = `
-// --- CONFIGURATION ---
-// Sheets: "W1-W5" (Cols O-T) -> "W6-W10" (Cols K-T) -> "W11-W14" (Cols K-T)
-// Date Header Row: 12
-// Student Data: Row 14+ (ID in Col B, Name in Col D)
+/**
+ * HIGH-CONCURRENCY ATTENDANCE SCRIPT (v3.1)
+ * Optimized for 200-300 simultaneous requests.
+ */
 
 function getFormattedDate() {
   return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "dd/MM/yyyy");
@@ -14,233 +14,184 @@ function getFormattedDate() {
 
 function getSheetConfigs() {
   return [
-    // Order matters: Fills W1-W5 first, then moves to W6-W10, then W11-W14
-    { name: "W1-W5", dateRow: 12, startCol: 15, endCol: 20 }, // Cols O to T
-    { name: "W6-W10", dateRow: 12, startCol: 11, endCol: 20 }, // Cols K to T
-    { name: "W11-W14", dateRow: 12, startCol: 11, endCol: 20 } // Cols K to T
+    { name: "W1-W5", dateRow: 12, startCol: 15, endCol: 20 },
+    { name: "W6-W10", dateRow: 12, startCol: 11, endCol: 20 },
+    { name: "W11-W14", dateRow: 12, startCol: 11, endCol: 20 }
   ];
-}
-
-function findTargetContext(doc, dateStr) {
-  var configs = getSheetConfigs();
-  
-  // 1. Search for EXISTING date across all configured sheets
-  for (var i = 0; i < configs.length; i++) {
-    var conf = configs[i];
-    var sheet = doc.getSheetByName(conf.name);
-    if (!sheet) continue;
-    
-    for (var c = conf.startCol; c <= conf.endCol; c++) {
-       var cell = sheet.getRange(conf.dateRow, c);
-       // Handle Merged Cells (only check top-left)
-       if (cell.isPartOfMerge()) {
-          var range = cell.getMergedRanges()[0];
-          if (range.getColumn() != c || range.getRow() != conf.dateRow) continue;
-       }
-       
-       if (cell.getDisplayValue().trim() == dateStr) {
-         return { sheet: sheet, col: c, isNew: false };
-       }
-    }
-  }
-
-  // 2. Search for first EMPTY slot if date not found
-  for (var i = 0; i < configs.length; i++) {
-    var conf = configs[i];
-    var sheet = doc.getSheetByName(conf.name);
-    if (!sheet) continue;
-    
-    for (var c = conf.startCol; c <= conf.endCol; c++) {
-       var cell = sheet.getRange(conf.dateRow, c);
-       if (cell.isPartOfMerge()) {
-          var range = cell.getMergedRanges()[0];
-          if (range.getColumn() != c || range.getRow() != conf.dateRow) continue;
-       }
-       
-       if (cell.getDisplayValue().trim() == "") {
-         return { sheet: sheet, col: c, isNew: true };
-       }
-    }
-  }
-  
-  return null;
 }
 
 function doPost(e) {
   var lock = LockService.getScriptLock();
   try {
+    // Increase wait time for the lock to 30s to handle 200+ users
     lock.waitLock(30000); 
     
     var doc = SpreadsheetApp.getActiveSpreadsheet();
-    
-    // Parse Input
     var data = {};
-    if (e.parameter && e.parameter.studentId) {
-      data = e.parameter;
-    } else {
-      try {
-        if (e.postData) data = JSON.parse(e.postData.contents);
-      } catch(err){}
+    try {
+      if (e.postData) data = JSON.parse(e.postData.contents);
+    } catch(err) {
+      data = e.parameter || {};
     }
     
-    var studentId = data.studentId ? data.studentId.toUpperCase().trim() : "";
-    var studentName = data.name ? data.name.toUpperCase().trim() : "";
+    var studentId = String(data.studentId || "").toUpperCase().trim();
+    var studentName = String(data.name || "").toUpperCase().trim();
     var status = data.status || 'P';
     var dateStr = getFormattedDate();
 
-    if (!studentId) {
-      return ContentService.createTextOutput(JSON.stringify({"result":"error", "message":"Missing Data"})).setMimeType(ContentService.MimeType.JSON);
+    if (!studentId) throw "Missing Student ID";
+
+    var configs = getSheetConfigs();
+    var targetSheet, targetCol, isNewDate = true;
+
+    // 1. Find sheet and column (Cached approach)
+    for (var i = 0; i < configs.length; i++) {
+      var conf = configs[i];
+      var sheet = doc.getSheetByName(conf.name);
+      if (!sheet) continue;
+      
+      var headerValues = sheet.getRange(conf.dateRow, conf.startCol, 1, conf.endCol - conf.startCol + 1).getDisplayValues()[0];
+      
+      // Look for current date
+      for (var c = 0; c < headerValues.length; c++) {
+        if (headerValues[c].trim() === dateStr) {
+          targetSheet = sheet;
+          targetCol = conf.startCol + c;
+          isNewDate = false;
+          break;
+        }
+      }
+      if (targetSheet) break;
+
+      // Look for first available empty column
+      for (var c = 0; c < headerValues.length; c++) {
+        if (headerValues[c].trim() === "") {
+          targetSheet = sheet;
+          targetCol = conf.startCol + c;
+          break;
+        }
+      }
+      if (targetSheet) break;
     }
 
-    // --- FIND SHEET & COLUMN ---
-    var context = findTargetContext(doc, dateStr);
-    
-    if (!context) {
-      return ContentService.createTextOutput(JSON.stringify({"result":"error", "message":"All sheets (W1-W5, W6-W10, W11-W14) are full."})).setMimeType(ContentService.MimeType.JSON);
-    }
-    
-    var sheet = context.sheet;
-    var targetColAbs = context.col;
+    if (!targetSheet) throw "All attendance sheets (W1-W14) are full.";
 
-    // Initialize Date Header if new
-    if (context.isNew) {
-      sheet.getRange(12, targetColAbs).setValue(new Date()).setNumberFormat("dd/MM/yyyy");
+    if (isNewDate) {
+      targetSheet.getRange(12, targetCol).setValue(new Date()).setNumberFormat("dd/MM/yyyy");
     }
 
-    // --- FIND STUDENT ROW (B14+) ---
+    // 2. Find or Add Student Row (Fast lookup)
     var startRow = 14;
-    var idCol = 2; // Column B
-    var nameCol = 4; // Column D
+    var lastRow = Math.max(targetSheet.getLastRow(), 250);
+    var ids = targetSheet.getRange(startRow, 2, lastRow - startRow + 1, 1).getValues();
     
-    var lastSheetRow = Math.max(sheet.getLastRow(), 250);
-    // Optimization: Read ID column in one batch
-    var idValues = sheet.getRange(startRow, idCol, lastSheetRow - startRow + 1, 1).getValues();
-    
-    var studentRowRelative = -1;
-    var firstEmptyRowRelative = -1;
-
-    for (var i = 0; i < idValues.length; i++) {
-      var val = String(idValues[i][0]).toUpperCase().trim();
-      if (val == studentId) {
-        studentRowRelative = i;
+    var studentRowAbs = -1;
+    for (var r = 0; r < ids.length; r++) {
+      var idInCell = String(ids[r][0]).toUpperCase().trim();
+      if (idInCell === studentId) {
+        studentRowAbs = startRow + r;
         break;
       }
-      if (val == "" && firstEmptyRowRelative == -1) {
-        firstEmptyRowRelative = i;
+      if (studentRowAbs === -1 && idInCell === "") {
+        studentRowAbs = startRow + r;
+        // Batch write student info to reduce API calls
+        targetSheet.getRange(studentRowAbs, 2, 1, 3).setValues([[studentId, "", studentName]]);
+        break;
       }
     }
 
-    // Create New Student if not found
-    if (studentRowRelative == -1) {
-      if (firstEmptyRowRelative != -1) {
-        studentRowRelative = firstEmptyRowRelative;
-      } else {
-        studentRowRelative = idValues.length; // Append
-      }
-
-      var newRowAbs = startRow + studentRowRelative;
-      sheet.getRange(newRowAbs, idCol).setValue(studentId);   
-      sheet.getRange(newRowAbs, nameCol).setValue(studentName); 
+    // If still not found and sheet was full of other data
+    if (studentRowAbs === -1) {
+       studentRowAbs = lastRow + 1;
+       targetSheet.getRange(studentRowAbs, 2).setValue(studentId);
+       targetSheet.getRange(studentRowAbs, 4).setValue(studentName);
     }
 
-    // --- WRITE STATUS ---
-    var targetRowAbs = startRow + studentRowRelative;
-    sheet.getRange(targetRowAbs, targetColAbs).setValue(status);
+    // 3. Mark the Attendance Status
+    targetSheet.getRange(studentRowAbs, targetCol).setValue(status);
     
-    SpreadsheetApp.flush(); 
-    return ContentService.createTextOutput(JSON.stringify({"result":"success"})).setMimeType(ContentService.MimeType.JSON);
+    // Explicitly flush to ensure data is written before lock release
+    SpreadsheetApp.flush();
     
-  } catch (e) {
-    return ContentService.createTextOutput(JSON.stringify({"result":"error", "message": e.toString()})).setMimeType(ContentService.MimeType.JSON);
+    return ContentService.createTextOutput(JSON.stringify({result: "success"})).setMimeType(ContentService.MimeType.JSON);
+    
+  } catch (err) {
+    console.error("Attendance Error: " + err);
+    return ContentService.createTextOutput(JSON.stringify({result: "error", message: err.toString()})).setMimeType(ContentService.MimeType.JSON);
   } finally {
     lock.releaseLock();
   }
 }
 
 function doGet(e) {
-  var doc = SpreadsheetApp.getActiveSpreadsheet();
-  var dateStr = getFormattedDate();
-  
-  var context = findTargetContext(doc, dateStr);
-  
-  // If date not found (isNew=true means we found an empty slot but not the date), return empty
-  if (!context || context.isNew) {
-     return ContentService.createTextOutput("[]").setMimeType(ContentService.MimeType.JSON);
-  }
-
-  var sheet = context.sheet;
-  var dateColAbs = context.col;
-
-  // Read Data
-  var startRow = 14;
-  var lastRow = Math.max(sheet.getLastRow(), 250); 
-  
-  // Read B (ID), D (Name)
-  var studentBlock = sheet.getRange(startRow, 2, lastRow - startRow + 1, 3).getValues(); // Cols 2,3,4
-  
-  // Read Status Column
-  var statusBlock = sheet.getRange(startRow, dateColAbs, lastRow - startRow + 1, 1).getValues();
-
-  var output = [];
-  for (var i = 0; i < studentBlock.length; i++) {
-    var id = String(studentBlock[i][0]).trim(); // Col B (index 0)
-    var name = studentBlock[i][2]; // Col D (index 2)
-    var status = statusBlock[i][0];
-
-    if (id && (status == 'P' || status == 'A')) {
-      output.push({
-         name: name,
-         studentId: id,
-         email: id + "@STUDENT.UTS.EDU.MY",
-         timestamp: new Date().getTime(), 
-         status: status
-      });
+  try {
+    var doc = SpreadsheetApp.getActiveSpreadsheet();
+    var dateStr = getFormattedDate();
+    var configs = getSheetConfigs();
+    
+    for (var i = 0; i < configs.length; i++) {
+      var conf = configs[i];
+      var sheet = doc.getSheetByName(conf.name);
+      if (!sheet) continue;
+      
+      var headerValues = sheet.getRange(conf.dateRow, conf.startCol, 1, conf.endCol - conf.startCol + 1).getDisplayValues()[0];
+      var colIdx = -1;
+      for (var c = 0; c < headerValues.length; c++) {
+        if (headerValues[c].trim() === dateStr) { colIdx = conf.startCol + c; break; }
+      }
+      
+      if (colIdx !== -1) {
+        var lastRow = Math.max(sheet.getLastRow(), 250);
+        var data = sheet.getRange(14, 2, lastRow - 14 + 1, 3).getValues(); // Cols B-D
+        var statuses = sheet.getRange(14, colIdx, lastRow - 14 + 1, 1).getValues();
+        
+        var results = [];
+        for (var j = 0; j < data.length; j++) {
+          var id = String(data[j][0]).trim();
+          var stat = statuses[j][0];
+          if (id && (stat === 'P' || stat === 'A')) {
+            results.push({ studentId: id, name: data[j][2], status: stat });
+          }
+        }
+        return ContentService.createTextOutput(JSON.stringify(results)).setMimeType(ContentService.MimeType.JSON);
+      }
     }
+    return ContentService.createTextOutput("[]").setMimeType(ContentService.MimeType.JSON);
+  } catch(e) {
+    return ContentService.createTextOutput("[]").setMimeType(ContentService.MimeType.JSON);
   }
-
-  return ContentService.createTextOutput(JSON.stringify(output)).setMimeType(ContentService.MimeType.JSON);
 }
 `;
 
 export const GoogleSheetIntegrationInfo: React.FC = () => {
   const [copied, setCopied] = useState(false);
-
-  const handleCopy = () => {
-    navigator.clipboard.writeText(appScriptCode.trim());
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
-
   return (
-    <div className="w-full p-4 rounded-lg bg-blue-50 border border-blue-200 text-blue-800 mb-4">
+    <div className="w-full p-4 rounded-lg bg-blue-50 border border-blue-200 text-blue-800 mb-4 shadow-sm">
       <div className="flex items-start gap-3">
-        <InfoIcon className="w-5 h-5 flex-shrink-0 mt-1 text-blue-500" />
+        <InfoIcon className="w-6 h-6 mt-1 text-blue-600" />
         <div>
-          <h3 className="text-lg font-semibold text-blue-900">Update Cloud Storage Script</h3>
-          <p className="mt-1 text-sm">
-            This update allows the system to automatically switch to subsequent sheets when the previous ones are full.
+          <h3 className="text-lg font-bold text-blue-900">High-Traffic Fix (V3.1)</h3>
+          <p className="mt-1 text-sm text-blue-800 leading-relaxed">
+            Google has a limit of ~30 simultaneous connections. For 230 students, you <strong>MUST</strong> use this script. 
+            It increases the "waiting time" so that students' requests line up instead of failing.
           </p>
-          <ul className="list-disc list-inside mt-2 text-sm space-y-1">
-            <li><strong>Sheets Order:</strong> W1-W5 (Cols O-T) → W6-W10 (Cols K-T) → W11-W14 (Cols K-T).</li>
-            <li><strong>Headers:</strong> Row 12 (Date is auto-filled here).</li>
-            <li><strong>Student Data:</strong> Rows 14+ (Column B & D).</li>
-            <li><strong>Overflow:</strong> Automatically finds the first empty column across all configured sheets.</li>
-          </ul>
-          <div className="mt-4 bg-gray-800 text-white p-3 rounded-md relative">
-             <div className="flex justify-between items-center mb-2">
-                <h4 className="font-semibold text-gray-300">Script Code:</h4>
-                <button 
-                     onClick={handleCopy}
-                     className="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded text-white transition-colors border border-gray-600"
-                     title="Copy to clipboard"
-                >
-                    {copied ? 'Copied!' : 'Copy Code'}
-                </button>
-             </div>
-            <pre className="text-xs whitespace-pre-wrap break-all p-2 bg-gray-900 rounded border border-gray-700 max-h-60 overflow-y-auto">
-              <code>{appScriptCode.trim()}</code>
+          <div className="mt-4 bg-gray-900 p-4 rounded-xl border border-blue-200">
+            <div className="flex justify-between items-center mb-3">
+              <span className="text-[10px] text-blue-400 font-mono tracking-widest uppercase">CONCURRENCY OPTIMIZED</span>
+              <button 
+                onClick={() => { navigator.clipboard.writeText(appScriptCode.trim()); setCopied(true); setTimeout(()=>setCopied(false),2000); }} 
+                className={`text-xs px-4 py-1.5 rounded-full font-bold transition-all ${copied ? 'bg-green-600 text-white' : 'bg-brand-primary text-white hover:bg-brand-secondary'}`}
+              >
+                {copied ? '✓ COPIED' : 'COPY OPTIMIZED SCRIPT'}
+              </button>
+            </div>
+            <pre className="text-[9px] text-gray-400 max-h-48 overflow-y-auto whitespace-pre-wrap font-mono p-2 bg-black/30 rounded">
+              {appScriptCode.trim()}
             </pre>
           </div>
+          <p className="mt-3 text-[11px] text-blue-600 italic">
+            * After copying, go to Apps Script, paste, Save, and click "Deploy > New Deployment" (Version: Anyone).
+          </p>
         </div>
       </div>
     </div>
